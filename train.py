@@ -4,7 +4,7 @@ from albumentations.pytorch import ToTensorV2
 from tqdm import tqdm
 import torch.nn as nn
 import torch.optim as optim
-from model import UNET
+from model import UNET, Discriminator
 from utils import (
     load_checkpoint,
     save_checkpoint,
@@ -22,18 +22,19 @@ NUM_WORKERS = 2
 IMAGE_HEIGHT = 68
 IMAGE_WIDTH = 68
 PIN_MEMORY = True
-LOAD_MODEL = True
+LOAD_MODEL = False
 TRAIN_IMG_DIR = "data/train/s_style/"
 TRAIN_POS_DIR = "data/train/s_pos/"
-VAL_IMG_DIR = "data/pred/s_style/"
-VAL_POS_DIR = "data/pred/s_pos/"
+VAL_IMG_DIR = "data/eval/s_style/"
+VAL_POS_DIR = "data/eval/s_pos/"
 
 def calc_content_loss(gen_feat, orig_feat):
     content_l = torch.mean((gen_feat - orig_feat) ** 2)
     return content_l
 
-def train_fn(loader, model, optimizer, scaler):
+def train_fn(loader, model, disc, optimizer, optimizer_disc, scalerU, scalerDisc):
     loop = tqdm(loader)
+    criterion = nn.BCEWithLogitsLoss()
 
     for batch_idx, (data, pos) in enumerate(loop):
         data = data.to(device=DEVICE)
@@ -42,16 +43,29 @@ def train_fn(loader, model, optimizer, scaler):
         # forward
         with torch.cuda.amp.autocast():
             predictions = model(data, pos)
-            loss = calc_content_loss(predictions, data)
+            real_gen = disc(data).reshape(-1)
+            loss_disc_real = criterion(real_gen, torch.ones_like(real_gen))
+            fake_gen = disc(predictions).reshape(-1)
+            loss_disc_fake = criterion(fake_gen, torch.zeros_like(fake_gen))
+            loss_disc = (loss_disc_real + loss_disc_fake) / 2
 
         # backward
+        optimizer_disc.zero_grad()
+        scalerDisc.scale(loss_disc).backward(retain_graph=True)
+        scalerDisc.step(optimizer_disc)
+        scalerDisc.update()
+
+        with torch.cuda.amp.autocast():
+            output = disc(predictions).reshape(-1)
+            loss_unet = criterion(output, torch.ones_like(output)) + calc_content_loss(predictions, data)
+
         optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        scalerU.scale(loss_unet).backward()
+        scalerU.step(optimizer)
+        scalerU.update()
 
         # update tqdm loop
-        loop.set_postfix(loss=loss.item())
+        loop.set_postfix(lossD=loss_disc.item(), lossU=loss_unet.item())
 
 
 def main():
@@ -80,7 +94,9 @@ def main():
     )
 
     model = UNET(in_channels=3, out_channels=3).to(DEVICE)
+    disc = Discriminator(3, 68).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    opt_disc = optim.Adam(disc.parameters(), lr=LEARNING_RATE, betas=(0.5, 0.999))
 
     train_loader, val_loader = get_loaders(
         TRAIN_IMG_DIR,
@@ -95,28 +111,36 @@ def main():
     )
 
     if LOAD_MODEL:
-        load_checkpoint(torch.load("checkpoints/my_checkpoint_0.pth.tar"), model)
+        load_checkpoint(torch.load("checkpoints/unet_0.pth.tar"), model)
+        load_checkpoint(torch.load("checkpoints/disc_0.pth.tar"), disc)
 
-    scaler = torch.cuda.amp.GradScaler()
+    scalerU = torch.cuda.amp.GradScaler()
+    scalerDisc = torch.cuda.amp.GradScaler()
 
-    predictions_as_imgs(val_loader, model, folder="pred_imgs/", device=DEVICE)
-"""
+    #predictions_as_imgs(val_loader, model, folder="pred_imgs/", device=DEVICE)
+
     for epoch in range(NUM_EPOCHS):
-        train_fn(train_loader, model, optimizer, scaler)
+        train_fn(train_loader, model, disc, optimizer, opt_disc, scalerU, scalerDisc)
 
         print("EPOCH ==> ", epoch)
         # save model
-        checkpoint = {
+        checkpointU = {
             "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),
         }
-        save_checkpoint(checkpoint, 0)
+        save_checkpoint(checkpointU, "unet_", 0)
+
+        checkpointD = {
+            "state_dict": disc.state_dict(),
+            "optimizer": opt_disc.state_dict(),
+        }
+        save_checkpoint(checkpointD, "disc_", 0)
 
         # print some examples to a folder
         save_predictions_as_imgs(
             val_loader, model, folder="eval_imgs/", device=DEVICE
         )
-"""
+
 
 if __name__ == "__main__":
     main()

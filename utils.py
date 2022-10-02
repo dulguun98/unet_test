@@ -3,9 +3,9 @@ import torchvision
 from dataset import MyDataset
 from torch.utils.data import DataLoader
 
-def save_checkpoint(state, index):
+def save_checkpoint(state, name, index):
     print("=> Saving checkpoint")
-    torch.save(state, "checkpoints/my_checkpoint_" + str(index) + ".pth.tar")
+    torch.save(state, "checkpoints/" + name + str(index) + ".pth.tar")
 
 def load_checkpoint(checkpoint, model):
     print("=> Loading checkpoint")
